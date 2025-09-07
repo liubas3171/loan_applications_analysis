@@ -1,0 +1,844 @@
+---
+title: "Loan data analysis"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+## Libraries import
+
+```{r}
+install.packages("dplyr")
+install.packages("lubridate")
+install.packages("ggplot2")
+install.packages("corrplot")
+install.packages("PerformanceAnalytics")
+install.packages("randomForest")
+install.packages("caret")
+
+```
+
+
+```{r}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(corrplot)
+library(PerformanceAnalytics)
+library(randomForest)
+library(caret)
+library(cluster)
+```
+
+## Data processing
+
+```{r}
+# data is taken from https://www.kaggle.com/datasets/ethon0426/lending-club-20072020q1
+data <- read.csv('Loan_status_2007-2020Q3.gzip')
+```
+
+
+```{r}
+head(data)
+```
+
+```{r}
+start_date = "2019-01-01"
+end_date = "2019-12-31"
+
+
+data <- data %>%
+  mutate(
+    issue_date_parsed = parse_date_time(issue_d, orders = "b-Y")
+  )
+
+df_2019 <- data %>% filter(issue_date_parsed >= ymd(start_date) &
+                          issue_date_parsed <= ymd(end_date))
+
+```
+
+```{r}
+rm(data)
+```
+
+
+```{r}
+head(df_2019)
+```
+
+Removal of columns where number na is bigger than threshold
+
+```{r}
+threshold <- 0.5
+missing_pct <- colMeans(is.na(df_2019))
+df_clean_2019 <- df_2019[, missing_pct <= threshold]
+df_clean_2019
+```
+
+Saving to csv
+```{r}
+write.csv(df_clean_2019, "df_clean_2019.csv", row.names = FALSE)
+```
+
+
+
+Turning some columns to numeric
+
+Loan status 
+
+```{r}
+df_clean_2019$loan_status_num <- dplyr::case_when(
+  df_clean_2019$loan_status %in% c("Fully Paid") ~ 1,
+  df_clean_2019$loan_status %in% c("Current", "In Grace Period") ~ 0,
+  df_clean_2019$loan_status %in% c("Late (31-120 days)", "Late (16-30 days)", "Charged Off", "Default") ~ -1,
+)
+```
+
+Fico score creation
+```{r}
+df_clean_2019$fico_score = (df_clean_2019$fico_range_low + df_clean_2019$fico_range_high) / 2
+```
+
+
+### Selecting of important variables
+
+```{r}
+cols_to_include <- c('loan_status_num', 'annual_inc', 'dti', 'loan_amnt',
+                     'fico_score', 'emp_title', 'emp_length', 'home_ownership',
+                     'verification_status', 'title', 'issue_date_parsed',
+                     'addr_state', 'term'#,
+                     # Tried these ones, but they didn't add value to the performance of models
+                     #'acc_now_delinq', 'earliest_cr_line', 'open_acc',
+                     #'pub_rec', 'revol_bal', 'mort_acc', 'pub_rec_bankruptcies'
+                     )
+
+df_clean_2019 <- df_clean_2019[(colnames(df_clean_2019) %in% cols_to_include)]
+df_clean_2019
+```
+
+```{r}
+cols_numeric <- sapply(df_clean_2019, is.numeric)
+summary(df_clean_2019[, cols_numeric])
+```
+
+
+### Tables of important variables
+
+
+
+#### Loan Status
+
+```{r}
+table(df_clean_2019$loan_status) / length(df_clean_2019$loan_status)
+table(df_clean_2019$loan_status)
+```
+
+#### Employment length
+
+
+```{r}
+table(df_clean_2019$emp_length) / length(df_clean_2019$emp_length)
+table(df_clean_2019$emp_length)
+```
+
+Turning into numeric var
+
+```{r}
+emp_map <- c("< 1 year" = 0.5,
+             "1 year"   = 1,
+             "2 years"  = 2,
+             "3 years"  = 3,
+             "4 years"  = 4,
+             "5 years"  = 5,
+             "6 years"  = 6,
+             "7 years"  = 7,
+             "8 years"  = 8,
+             "9 years"  = 9,
+             "10+ years"= 10)
+df_clean_2019$emp_length_num <- unname(emp_map[df_clean_2019$emp_length])
+
+```
+
+
+```{r}
+df_clean_2019 <- df_clean_2019[!is.na(df_clean_2019$emp_length_num), ]
+```
+
+```{r}
+tab <- table(df_clean_2019$emp_length_num)
+
+barplot(tab, las = 2, col = "skyblue", main = "Employment Years Distribution")
+```
+
+
+
+#### Employment title
+
+Too many different titles, so not included into the model
+
+```{r}
+
+temp = table(df_clean_2019$emp_title)
+temp = sort(temp[temp>1], decreasing = TRUE)
+head(temp, 10)
+
+```
+
+#### Home ownership
+
+```{r}
+table(df_clean_2019$home_ownership) / length(df_clean_2019$home_ownership)
+table(df_clean_2019$home_ownership)
+```
+Create dummies for these categories
+
+```{r}
+df_clean_2019$home_ownership <- factor(df_clean_2019$home_ownership)
+
+dummies <- model.matrix(~ home_ownership - 1, data = df_clean_2019)
+
+df_clean_2019 <- cbind(df_clean_2019, as.data.frame(dummies))
+
+# Delete columns, since only few values are present
+df_clean_2019 <- df_clean_2019[, !(names(df_clean_2019) %in% c("home_ownershipANY", "home_ownershipNONE"))]
+
+```
+
+
+
+#### Term
+
+```{r}
+table(df_clean_2019$term) / length(df_clean_2019$term)
+table(df_clean_2019$term)
+```
+Turning into dummies
+```{r}
+df_clean_2019$term <- factor(df_clean_2019$term)
+
+dummies <- model.matrix(~ term - 1, data = df_clean_2019)
+
+df_clean_2019 <- cbind(df_clean_2019, as.data.frame(dummies))
+```
+
+
+
+#### Verification status
+
+```{r}
+table(df_clean_2019$verification_status) / length(df_clean_2019$verification_status)
+table(df_clean_2019$verification_status)
+```
+
+Turning into dummies
+
+```{r}
+df_clean_2019$verification_status <- factor(df_clean_2019$verification_status)
+
+dummies <- model.matrix(~ verification_status - 1, data = df_clean_2019)
+
+df_clean_2019 <- cbind(df_clean_2019, as.data.frame(dummies))
+```
+
+
+
+#### Address
+
+
+```{r}
+sort(table(df_clean_2019$addr_state) / length(df_clean_2019$addr_state), TRUE)
+sort(table(df_clean_2019$addr_state), TRUE)
+```
+
+Turning into dummies
+```{r}
+df_clean_2019$addr_state <- factor(df_clean_2019$addr_state)
+
+dummies <- model.matrix(~ addr_state - 1, data = df_clean_2019)
+
+df_clean_2019 <- cbind(df_clean_2019, as.data.frame(dummies))
+```
+
+
+
+#### Title
+
+
+```{r}
+sort(table(df_clean_2019$title) / length(df_clean_2019$title), TRUE)
+sort(table(df_clean_2019$title), TRUE)
+```
+
+Turning into dummies
+
+```{r}
+df_clean_2019$title <- factor(df_clean_2019$title)
+
+dummies <- model.matrix(~ title - 1, data = df_clean_2019)
+
+df_clean_2019 <- cbind(df_clean_2019, as.data.frame(dummies))
+
+# Removing learning and training and Green loan because only few of them 
+df_clean_2019 <- df_clean_2019[, !(names(df_clean_2019) %in%
+                                     c("titleLearning and training",
+                                       "titleGreen loan"))]
+
+```
+
+
+
+
+## Charts and NA/outliers removal
+
+
+### Loan Amount
+
+```{r}
+ggplot(df_clean_2019, aes(x = loan_amnt)) +
+  geom_histogram(bins = 50, fill = "blue", color = "black") +
+  labs(title = "Loan Amount Distribution", x = "Loan Amount", y = "Frequency")
+```
+
+### Annual Income
+
+```{r}
+boxplot(df_clean_2019$annual_inc)
+boxplot(df_clean_2019[df_clean_2019$annual_inc < 500000,]$annual_inc)
+```
+
+#### Outliers removal Income
+
+As per 2 charts above, there are outliers only on top of the distribution, so delete top 1%
+
+```{r}
+upper_bound <- quantile(df_clean_2019$annual_inc, 0.99)
+len_before <- length(df_clean_2019$annual_inc)
+
+df_clean_2019 <- df_clean_2019[df_clean_2019$annual_inc < upper_bound, ]
+
+len_after <- length(df_clean_2019$annual_inc)
+```
+
+Absolute number of deleted lines:
+```{r}
+len_before - len_after
+```
+
+```{r}
+ggplot(df_clean_2019, aes(x = annual_inc)) +
+  geom_histogram(bins = 50, fill = "blue", color = "black") +
+  labs(title = "Annual Income Distribution", x = "Annual Income", y = "Frequency")
+```
+
+### DTI
+
+```{r}
+boxplot(df_clean_2019$dti)
+boxplot(df_clean_2019[df_clean_2019$dti < 200,]$dti)
+```
+Remove only top 1% and NAs
+
+Number of NAs:
+```{r}
+sum(is.na(df_clean_2019$dti))
+```
+```{r}
+df_clean_2019 <- df_clean_2019[!is.na(df_clean_2019$dti), ]
+```
+
+
+
+```{r}
+upper_bound <- quantile(df_clean_2019$dti, 0.99, na.rm = TRUE)
+len_before <- length(df_clean_2019$dti)
+
+df_clean_2019 <- df_clean_2019[df_clean_2019$dti < upper_bound, ]
+
+len_after <- length(df_clean_2019$dti)
+```
+
+Number of removed rows:
+```{r}
+len_before - len_after
+```
+
+
+```{r}
+ggplot(df_clean_2019, aes(x = dti)) +
+  geom_histogram(bins = 50, fill = "blue", color = "black") +
+  labs(title = "Debt-To-Income Ratio Distribution", x = "DTI Ratio", y = "Frequency")
+```
+
+### FICO score
+
+```{r}
+sum(is.na(df_clean_2019$fico_score))
+```
+
+
+```{r}
+ggplot(df_clean_2019, aes(x = fico_score)) +
+  geom_histogram(bins = 38, fill = "blue", color = "black") +
+  labs(title = "FICO Score Distribution", x = "FICO score", y = "Frequency")
+```
+
+
+## Correlations
+
+```{r}
+cols_numeric <- sapply(df_clean_2019, is.numeric)
+cor_matrix = cor(df_clean_2019[,cols_numeric], use="complete.obs")
+
+```
+
+
+High correlation with Loan Status
+
+```{r}
+cor_vec <- cor_matrix["loan_status_num", ]
+cor_vec <- cor_vec[!is.na(cor_vec)] 
+selected <- cor_vec[abs(cor_vec) > 0.05]
+
+sort(selected, TRUE)
+```
+
+```{r}
+#col_range <- colorRampPalette(c("blue", "white", "red"))(200)
+
+#corrplot(cor_matrix, method = "color", type="lower", diag = FALSE,
+#         tl.cex=0.7,col = col_range, tl.col = "black")
+```
+
+### Leaving only good and bad loans
+
+```{r}
+df_clean_2019 <- df_clean_2019[df_clean_2019$loan_status_num %in% c(1, -1), ]
+
+# removes spaces, <, and other stuff from names
+names(df_clean_2019) <- make.names(names(df_clean_2019))
+```
+
+
+### Balancing dataset by undersampling +1
+
+```{r}
+table(df_clean_2019$loan_status_num)
+```
+
+
+```{r}
+df_balanced <- df_clean_2019 %>%
+  group_by(loan_status_num) %>%
+  #sample_n(5000)
+  sample_n(min(table(df_clean_2019$loan_status_num)))
+```
+
+```{r}
+table(df_balanced$loan_status_num)
+```
+
+Analysis of continuous variables
+
+```{r}
+cols_analysis <- c('annual_inc', 'loan_status_num', 'dti', 'fico_score',
+                   'loan_amnt', 'emp_length_num'
+                   )
+
+sample_idx <- sample(1:nrow(df_balanced), 5000)
+analysis_sample <- df_balanced[sample_idx, cols_analysis]
+chart.Correlation(analysis_sample, histogram=TRUE, pch=19)
+```
+
+
+
+## Supervised learning
+
+
+### Random forest
+
+### Parameters tuning random forest
+
+Using only subset of 5K lines for performance
+
+```{r}
+sample_idx <- sample(1:nrow(df_balanced), 5000)
+finetuning_sample <- df_balanced[sample_idx, sapply(df_balanced, is.numeric)]
+```
+
+
+
+```{r}
+set.seed(123)
+
+# Train/Validation/Test Split
+train_index <- createDataPartition(finetuning_sample$loan_status_num, p = 0.7, list = FALSE)
+train_valid <- finetuning_sample[train_index, sapply(finetuning_sample, is.numeric)]
+test        <- finetuning_sample[-train_index, sapply(finetuning_sample, is.numeric)]
+
+# Split train into train+validation (e.g. 80/20 split of train_valid)
+train_index2 <- createDataPartition(train_valid$loan_status_num, p = 0.8, list = FALSE)
+train <- train_valid[train_index2, ]
+valid <- train_valid[-train_index2, ]
+
+train$loan_status_num <- factor(train$loan_status_num, levels = c(-1, 1))
+valid$loan_status_num <- factor(valid$loan_status_num, levels = c(-1, 1))
+test$loan_status_num  <- factor(test$loan_status_num,  levels = c(-1, 1))
+
+
+# Grid of parameters
+param_grid <- expand.grid(
+  ntree   = c(100, 200, 300),
+  mtry    = c(3, 5, 7, floor(sqrt(ncol(train) - 1))),
+  nodesize = c(1, 5, 10)
+)
+
+best_f1 <- 0
+best_params <- NULL
+
+# Loop over parameters
+for (i in 1:nrow(param_grid)) {
+  params <- param_grid[i, ]
+  
+  rf_model <- randomForest(
+    loan_status_num ~ .,
+    data = train,
+    ntree = params$ntree,
+    mtry = params$mtry,
+    nodesize = params$nodesize
+  )
+  
+  pred_valid <- predict(rf_model, newdata = valid)
+  
+  cm <- confusionMatrix(pred_valid, valid$loan_status_num, positive = "1")
+  f1 <- cm$byClass["F1"]
+  
+  if (f1 > best_f1) {
+    best_f1 <- f1
+    best_params <- params
+  }
+}
+
+
+# Retrain with best params on train+valid
+rf_final <- randomForest(
+  loan_status_num ~ .,
+  data = rbind(train, valid),
+  ntree = best_params$ntree,
+  mtry = best_params$mtry,
+  nodesize = best_params$nodesize,
+  importance = TRUE
+)
+
+# Test evaluation
+pred_test <- predict(rf_final, newdata = test)
+cm_test <- confusionMatrix(pred_test, test$loan_status_num, positive = "1")
+
+precision <- cm_test$byClass["Precision"]
+recall    <- cm_test$byClass["Recall"]
+f1        <- cm_test$byClass["F1"]
+
+precision; recall; f1
+
+```
+```{r}
+best_params
+```
+
+### Train using all the data
+
+
+```{r}
+# Split into train/test
+set.seed(123)
+train_index <- createDataPartition(df_balanced$loan_status_num, p = 0.7, list = FALSE)
+
+train <- df_balanced[train_index, sapply(df_balanced, is.numeric)]
+test  <- df_balanced[-train_index, sapply(df_balanced, is.numeric)]
+
+train$loan_status_num <- factor(train$loan_status_num, levels = c(-1, 1))
+test$loan_status_num <- factor(test$loan_status_num, levels = c(-1, 1))
+
+# Fit Random Forest model with the best params from above
+rf_model <- randomForest(
+  loan_status_num ~ .,
+  data = train,
+  ntree = 300,
+  mtry = 8,
+  nodesize = 5,
+  importance = TRUE
+)
+
+print(rf_model)
+
+# Predict on test set
+pred <- predict(rf_model, newdata = test)
+
+
+# Confusion matrix
+cm <- confusionMatrix(factor(pred), factor(test$loan_status_num), positive = "1")
+
+precision <- cm$byClass["Precision"]
+recall    <- cm$byClass["Recall"]
+f1        <- cm$byClass["F1"]
+
+precision; recall; f1
+```
+
+
+
+
+
+
+### Confusion matrix
+
+```{r}
+cm_table <- as.data.frame(cm$table)
+
+ggplot(cm_table, aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), vjust = 1.5, color = "white", size = 6) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Confusion Matrix", x = "Predicted", y = "Actual") +
+  theme_minimal(base_size = 14)
+```
+
+```{r}
+importance(rf_final)
+varImpPlot(rf_final, n.var = 10)
+```
+
+### Logistic regression
+
+```{r}
+basic_vars = c("loan_amnt", "annual_inc", "dti",
+      "loan_status_num", "fico_score",
+      "emp_length_num", "term.60.months",
+      "home_ownershipRENT", "home_ownershipMORTGAGE",
+      "verification_statusVerified", "verification_statusSource.Verified"
+      )
+
+
+# Fit logistic regression
+logit_model <- glm(loan_status_num ~ ., data = train[(colnames(train) %in% basic_vars)], family = binomial)
+
+# Predict probabilities
+pred_prob <- predict(logit_model, newdata = test[(colnames(test) %in% basic_vars)], type = "response")
+
+# Convert probabilities to class (threshold 0.5)
+pred_class <- ifelse(pred_prob > 0.5, 1, -1)
+
+
+cm <- confusionMatrix(factor(pred_class, levels=c(-1,1)),
+                      factor(test$loan_status_num, levels=c(-1,1)),
+                      positive = "1")
+
+print(cm)
+
+precision <- cm$byClass["Precision"]
+recall    <- cm$byClass["Recall"]
+f1        <- cm$byClass["F1"]
+
+precision; recall; f1
+```
+
+```{r}
+cm_table <- as.data.frame(cm$table)
+
+ggplot(cm_table, aes(x = Prediction, y = Reference, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), vjust = 1.5, color = "white", size = 6) +
+  scale_fill_gradient(low = "lightblue", high = "darkblue") +
+  labs(title = "Confusion Matrix", x = "Predicted", y = "Actual") +
+  theme_minimal(base_size = 14)
+```
+
+
+```{r}
+summary(logit_model)
+```
+
+```{r}
+exp(coef(logit_model))
+```
+Interpretation: additional employment year decreases chance of default by 2 percent; additional dti point increases default by 2 %
+
+
+
+
+## Unsupervised learning
+
+
+```{r}
+
+set.seed(123)
+sample_idx <- sample(1:nrow(df_balanced), 10000)
+num_cols <- df_balanced[sample_idx,]
+
+x = c("loan_amnt", "annual_inc", "dti",
+      "loan_status_num", "fico_score",
+      "emp_length_num")
+
+num_cols <- num_cols[(colnames(num_cols) %in% x)]
+
+# Remove columns with zero variance
+num_cols <- num_cols[, apply(num_cols, 2, var) != 0]
+
+pca_res <- prcomp(num_cols, scale. = TRUE)
+summary(pca_res)
+
+pca_df <- as.data.frame(pca_res$x[,1:2])
+ggplot(pca_df, aes(PC1, PC2)) +
+  geom_point(alpha=0.6) +
+  theme_minimal()
+```
+
+
+### Loadings visualisation
+```{r}
+pca_df$loan_status <- factor(num_cols$loan_status_num)
+
+# Loadings
+loadings <- as.data.frame(pca_res$rotation[,1:2])
+loadings$varname <- rownames(loadings)
+loadings[,1:2] <- loadings[,1:2] * 5     # scale arrows so they're visible
+
+explained_var <- round(100 * summary(pca_res)$importance[2, 1:2], 1)
+
+# Plot scores + arrows
+ggplot(pca_df, aes(PC1, PC2, color=loan_status)) +
+  geom_point(size=0.7, alpha=0.6) +
+  geom_segment(data=loadings, aes(x=0, y=0, xend=PC1, yend=PC2),
+               arrow=arrow(length=unit(0.2,"cm")), color="black") +
+  geom_text(data=loadings, aes(x=PC1, y=PC2, label=varname),
+            color="black", vjust=1.5, size=3) +
+  theme_minimal() +
+  labs(
+  title="PCA Biplot",
+    color="Loan Status",
+    x = paste0("PC1 (", explained_var[1], "%)"),
+    y = paste0("PC2 (", explained_var[2], "%)")
+  )
+```
+```{r}
+loadings
+```
+
+
+
+## Clustering
+
+### K means
+
+#### Choosing K
+
+
+
+```{r}
+set.seed(123)
+sample_idx <- sample(1:nrow(df_balanced), 10000)
+num_cols_kmeans <- df_balanced[sample_idx,]
+x = c("loan_amnt", "annual_inc", "dti",
+      "loan_status_num", "fico_score",
+      "emp_length_num")
+
+num_cols_kmeans <- num_cols_kmeans[(colnames(num_cols_kmeans) %in% x)]
+
+# Remove NAs
+num_cols_kmeans <- na.omit(num_cols_kmeans)
+
+# Scale numeric features
+X <- scale(num_cols_kmeans %>% select(-loan_status_num))
+```
+
+
+```{r}
+set.seed(123)
+wcss <- sapply(1:10, function(k) {
+  kmeans(X, centers = k, nstart = 25)$tot.withinss
+})
+
+plot(1:10, wcss, type="b", pch=19,
+     xlab="Number of clusters (k)",
+     ylab="Within-cluster sum of squares",
+     main="Elbow Method")
+```
+```{r}
+set.seed(123)
+sil_width <- sapply(2:10, function(k){
+  km <- kmeans(X, centers = k, nstart = 25)
+  ss <- silhouette(km$cluster, dist(X))
+  mean(ss[, 3])
+})
+
+plot(2:10, sil_width, type="b", pch=19,
+     xlab="Number of clusters (k)",
+     ylab="Average silhouette width",
+     main="Silhouette Method")
+```
+
+From above, K = 3
+
+
+#### Results
+
+
+```{r}
+sample_idx <- sample(1:nrow(df_balanced), 35000)
+df_seg <- df_balanced[sample_idx,]
+x = c("loan_amnt", "annual_inc", "dti",
+      "loan_status_num", "fico_score",
+      "emp_length_num")
+
+df_seg <- df_seg[(colnames(df_seg) %in% x)]
+
+df_seg <- na.omit(df_seg)
+
+X <- scale(df_seg %>% select(-loan_status_num))
+
+set.seed(123)
+km <- kmeans(X, centers = 3, nstart = 25)
+
+# Add cluster labels
+df_seg$cluster <- factor(km$cluster)
+
+# Visualize
+pca <- prcomp(X)
+pca_df <- as.data.frame(pca$x[,1:2])
+pca_df$cluster <- df_seg$cluster
+pca_df$loan_status <- df_seg$loan_status_num
+
+ggplot(pca_df, aes(PC1, PC2, color=cluster)) +
+  geom_point(alpha=0.6, size=0.7) +
+  labs(title="Borrower Segmentation via K-means", color="Cluster") +
+  theme_minimal()
+
+#ggplot(pca_df, aes(PC1, PC2, color=factor(loan_status), shape=cluster)) +
+#  geom_point(alpha=0.6, size=0.7) +
+#  labs(title="Borrower Segmentation via K-means", color="Loan Status", shape="Cluster") +
+#  theme_minimal()
+```
+
+```{r}
+summary(pca)
+```
+
+```{r}
+# Summarize clusters
+cluster_summary <- df_seg %>%
+  group_by(cluster) %>%
+  summarise(
+    n = n(),
+    avg_loan = mean(loan_amnt, na.rm=TRUE),
+    avg_income = mean(annual_inc, na.rm=TRUE),
+    avg_dti = mean(dti, na.rm=TRUE),
+    avg_fico = mean(fico_score, na.rm=TRUE),
+    avg_emp_length = mean(emp_length_num, na.rm=TRUE),
+    default_rate = mean(loan_status_num == -1, na.rm=TRUE)
+  )
+
+print(cluster_summary)
+
+```
+
+
